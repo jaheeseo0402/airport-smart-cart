@@ -34,7 +34,7 @@
 
 ## 2. 사용 부품
 
-- 아두이노 우노 1, 라즈베리파이 1 (카메라 모듈은 연결만 했고 아직 사용하지 않음)
+- 아두이노 우노 1, 라즈베리파이 1 (카메라 모듈로 사람 감지)
 - 초음파 센서 HC-SR04 4개 (앞, 왼쪽, 오른쪽, 뒤)
 - IR 라인센서 2개 (왼쪽, 오른쪽)
 - 모터 드라이버(A-1A, A-2A, B-1A, B-2A 입력) 1, DC 모터 2, 모터용 배터리, 브레드보드, 점퍼선
@@ -82,11 +82,12 @@
 - `week1_obstacle_logic.py`: 칼만필터, TTC, 방향별 위험 단계, 연속 3프레임 확인, 긴급 제동 후 1초 억제, 우선순위 판단을 담은 **판단 로직**입니다. 직접 실행하면 모의 센서값으로 검증합니다.
 - `pi_obstacle_stop4.py`: 아두이노의 거리 4개를 로직에 넣어 위험(HIGH 이상)이면 `S`를 보내고, 앞이 30cm보다 멀어진 상태가 0.5초 이어지면 `G`를 보냅니다. 뒤는 정지에 쓰지 않습니다.
 - `pi_sensor_test.py`: 초음파 4개와 라인센서 값을 파이 화면에서 확인하는 시험용입니다. (판단은 하지 않음)
-- `main.py`: 초음파 + 라인 이탈 감시 + 카메라(YOLO 사람 감지)를 합친 통합 판단입니다. 초음파 위험(앞 20cm/옆 8cm 이하), 가까운 사람(카메라), 라인 이탈(둘 다 흰색 4초 이상) 중 하나라도 해당하면 `S`, 앞이 30cm보다 멀고 위험이 없으면 `G`를 보냅니다. YOLO는 `yolo_detector.py`가 있을 때만 켜지고(이 저장소에는 포함하지 않음), 없으면 초음파와 라인만으로 동작합니다.
+- `yolo_detector.py`: 파이 카메라로 사람(person)을 감지해 최신 결과(`person`, `count`, `max_area`, `fps`)를 쓰레드로 갱신합니다. 단독 실행(`python3 yolo_detector.py`)으로 사람 수와 박스 크기(%)를 확인할 수 있습니다. `max_area`는 화면에서 사람 박스가 차지하는 비율이라 클수록 가깝습니다.
+- `main.py`: 초음파 + 라인 이탈 감시 + 카메라(YOLO 사람 감지)를 합친 통합 판단입니다. 초음파 위험(앞 20cm/옆 8cm 이하), 가까운 사람(카메라), 라인 이탈(둘 다 흰색 4초 이상) 중 하나라도 해당하면 `S`, 앞이 30cm보다 멀고 위험이 없으면 `G`를 보냅니다. YOLO는 `yolo_detector.py`(파이 카메라 모듈 + `ultralytics`의 yolo11n, person 클래스)가 있을 때만 켜지고, 없거나 켜지 못하면 초음파와 라인만으로 동작합니다.
 
 위험 기준 거리와 TTC 계산 예시: [`docs/risk_and_ttc.md`](docs/risk_and_ttc.md)
 
-- `cart_bridge.py`: 웹의 `/robot/command`를 0.1초마다 읽어 출발 허가(`driving`/`returning`)가 있을 때만 `main.py`의 판단(`Brain`)으로 달리게 하고, 위험 단계·TTC·진행률을 `/robot/status`로 보고합니다. 웹 연결이 끊기면 안전하게 정지합니다. `TRIP_SECONDS`(출발점→게이트), `RETURN_LAP_SECONDS`(게이트→출발점, 우회 통로)를 시간으로 재서 넣으면 도착과 자동 반납이 동작합니다. (시간 기반 단순화)
+- `cart_bridge.py`: 웹의 `/robot/command`를 0.1초마다 읽어 출발 허가(`driving`/`returning`)가 있을 때만 `main.py`의 판단(`Brain`)으로 달리게 하고, 위험 단계·TTC·진행률을 `/robot/status`로 보고합니다. 웹 연결이 끊기면 안전하게 정지합니다. `USE_YOLO = True`이면 카메라로 사람이 화면의 `PERSON_AREA_STOP`(기본 30%) 이상으로 크게 보일 때도 정지하고, 사라지면 재출발합니다. `TRIP_SECONDS`(출발점→게이트), `RETURN_LAP_SECONDS`(게이트→출발점, 우회 통로)를 시간으로 재서 넣으면 도착과 자동 반납이 동작합니다. (시간 기반 단순화)
 
 ### 4-3. 웹과 QR (`web/`)
 
@@ -127,7 +128,7 @@ python3 make_cart_qr.py 07 http://<파이 IP>:5000   # cart_07_qr.png 를 카트
 cd raspberry_pi
 python3 cart_bridge.py /dev/ttyACM0
 ```
-폰과 파이는 같은 와이파이(또는 폰 핫스팟)에 있어야 하고, 폰으로 QR을 찍으면 탑승구 선택 화면이 열립니다. 이 버전은 YOLO를 쓰지 않습니다.
+폰과 파이는 같은 와이파이(또는 폰 핫스팟)에 있어야 하고, 폰으로 QR을 찍으면 탑승구 선택 화면이 열립니다. 카메라(YOLO)는 `cart_bridge.py` 위쪽의 `USE_YOLO`로 켜고 끕니다. 카메라는 한 프로그램만 쓸 수 있어서 `yolo_detector.py` 단독 실행은 끄고 시작합니다.
 
 시리얼 포트는 한 프로그램만 열 수 있어서 `pi_sensor_test.py`, `pi_obstacle_stop4.py`, `main.py`를 동시에 실행하면 안 됩니다. 아두이노 IDE의 시리얼 모니터도 닫고 실행합니다.
 
@@ -152,6 +153,7 @@ cd ../raspberry_pi && python3 test_cart_integration_friendweb.py   # 웹 + cart_
 - [ ] 옆, 뒤 센서 동작
 - [ ] 웹: QR 찍고 탑승구 선택 → 카트 출발
 - [ ] 웹 화면에 위험 단계·TTC 표시, 장애물 정지/재출발
+- [ ] 카메라: 사람 박스 크기(%) 측정(사진 기준 39~50%에서 인식), 주행 중 사람 사진 앞에서 정지/재출발, 기준값(`PERSON_AREA_STOP`) 확정
 - [ ] 도착 후 정지, 반납 → 우회 통로 복귀 (시간 측정값: TRIP_SECONDS __ / RETURN_LAP_SECONDS __)
 
 ---
@@ -164,7 +166,7 @@ cd ../raspberry_pi && python3 test_cart_integration_friendweb.py   # 웹 + cart_
 - 초음파는 반사 환경(재질, 각도)에 따라 값이 튈 수 있어 칼만필터와 연속 프레임 확인으로 보완했습니다.
 - 도착과 복귀는 센서가 아니라 **주행 시간**으로 판단하는 단순화입니다. (게이트 앞 정지, 출발점 정지) 배터리가 줄면 위치가 어긋날 수 있어 실제로는 바닥 마커나 카메라가 필요합니다.
 - 복귀는 게이트 뒤로 이어지는 우회 통로(순환 라인)를 따라 앞으로 달리는 방식입니다. 게이트별(A/B) 분기 경로는 후속 과제입니다.
-- 카메라(YOLO) 기반 사람 인식, 아두이노-파이 무선 통신은 후속 과제입니다.
+- 카메라(YOLO)는 사진으로 시험한 사람 감지를 정지 판단의 보조(먼 거리)로 쓰며, 실제 사람과 다양한 환경에서의 성능은 검증하지 않았습니다. 아두이노-파이 무선 통신은 후속 과제입니다.
 
 ---
 
@@ -191,9 +193,11 @@ airport-smart-cart/
 │   ├─ pi_obstacle_stop4.py
 │   ├─ pi_sensor_test.py
 │   ├─ main.py
+│   ├─ yolo_detector.py                    # 카메라 사람 감지
 │   ├─ cart_bridge.py                      # 웹 <-> 카트 연결
 │   ├─ test_cart_bridge.py
-│   └─ test_cart_integration_friendweb.py
+│   ├─ test_cart_integration_friendweb.py
+│   └─ test_cart_yolo.py
 └─ web/
     ├─ cart_web.py
     ├─ qr_signature.py

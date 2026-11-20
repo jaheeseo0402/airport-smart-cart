@@ -13,7 +13,8 @@ cart_bridge.py : 카트 프로그램 (시리얼 + 정지 판단) + 웹(cart_web.
   - 출발 허가: phase == "driving" 그리고 stopped == false. 아니면 항상 정지('S').
   - 웹에 연결이 안 되면 안전하게 정지한다.
   - 안전 정지(초음파/라인)는 허가와 상관없이 항상 우선한다. (main.py 의 Brain 판단을 그대로 씀)
-  - 이 버전은 YOLO(카메라)를 쓰지 않는다.
+  - 카메라(YOLO): USE_YOLO = True 이고 yolo_detector.py 가 있으면 켜진다. 사람이 화면의 main.PERSON_AREA_STOP(30%) 이상으로 크게 보이면(= 가까움) 정지, 사라지면 재출발.
+    카메라를 켜지 못하면(파일 없음/오류) 경고만 내고 초음파와 라인만으로 동작한다.
 
 자동 반납(우회 통로 방식): 게이트 뒤로 라인이 이어져 출발점으로 돌아오는 우회 통로(순환 경로)를 만든다.
   승객이 반납을 누르면(phase == "returning") 카트가 앞으로 다시 출발해 라인을 따라 달리고,
@@ -43,6 +44,7 @@ WEB = "http://127.0.0.1:5000"
 COMMAND_POLL_S = 0.1
 STATUS_POST_S = 0.3
 HTTP_TIMEOUT_S = 0.5
+USE_YOLO = True                 # False 면 카메라를 쓰지 않음 (초음파/라인만)
 TRIP_SECONDS = None             # 예: 25 (주행 시간이 이만큼이면 도착 보고). None = 도착 보고 안 함
 
 RETURN_SECONDS = 3.0            # RETURN_LAP_SECONDS 가 None 일 때만: 반납 후 이 시간이 지나면 "복귀 완료"만 보고 (카트는 안 움직임)
@@ -134,7 +136,7 @@ def build_status(brain, driven_s):
     return payload
 
 
-def controller_loop(port, stop_event, link, serial_factory=serial.Serial):
+def controller_loop(port, stop_event, link, serial_factory=serial.Serial, detector=None):
     ser = serial_factory(port, ctrl.BAUD, timeout=0.05)
     time.sleep(2)
     ser.reset_input_buffer()
@@ -217,14 +219,15 @@ def controller_loop(port, stop_event, link, serial_factory=serial.Serial):
                     distances = ctrl.parse_distances(line)
                     if distances:
                         brain.on_distances(distances, now)
-                        cmd = None if not allowed else brain.decide(now, None)
+                        yolo = detector.get() if detector else None
+                        cmd = None if not allowed else brain.decide(now, yolo)
                         if not allowed:
                             brain.ultrasonic_danger()          # 상태 표시용 갱신
                         if cmd:
                             send(cmd)
                             if cmd == "S":
                                 last_stop_sent = now
-                            print(f">>> {cmd} 전송  {ctrl.status_text(brain, None, now)}")
+                            print(f">>> {cmd} 전송  {ctrl.status_text(brain, yolo, now)}")
 
             if allowed and TRIP_SECONDS and driven_s >= TRIP_SECONDS and not arrived_sent:
                 send("S")
@@ -248,15 +251,29 @@ def main():
     if port is None:
         print("시리얼 포트를 찾지 못했습니다. 아두이노 USB 연결을 확인하세요.")
         return
+    detector = None
+    if USE_YOLO:
+        try:
+            from yolo_detector import YoloDetector
+            print("YOLO 로딩 중...")
+            detector = YoloDetector()
+            detector.start()
+            print("YOLO 시작됨")
+        except Exception as e:
+            print(f"[경고] 카메라(YOLO)를 켜지 못했습니다. 초음파/라인만 사용합니다: {e}")
+            detector = None
+
     stop_event = threading.Event()
     link = WebLink(stop_event)
     link.start()
     try:
-        controller_loop(port, stop_event, link)
+        controller_loop(port, stop_event, link, detector=detector)
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
+        if detector:
+            detector.stop()
 
 
 if __name__ == "__main__":

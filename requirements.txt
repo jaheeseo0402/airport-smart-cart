@@ -2,3 +2,4 @@ Flask
 werkzeug
 pyserial
 qrcode[pil]
+ultralytics        # 카메라 사람 감지 (picamera2 는 파이 OS 기본 패키지)
