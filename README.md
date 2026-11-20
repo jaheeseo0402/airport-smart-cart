@@ -4,7 +4,7 @@
 탑승권(게이트 번호)을 입력하면 카트가 바닥의 라인을 따라 게이트까지 이동하고, 장애물이 가까워지면 멈췄다가 장애물이 사라지면 다시 출발합니다.
 
 - 팀: 바퀴친구들 (서재희, 김예린, 최가온, 한정민) / ToI모빌리티 트랙
-- 융합보안 요소: HMAC 서명 QR 검증(위조 QR 차단), 웹 로그인(해시 비밀번호), 비밀값 환경변수 분리
+- 융합보안 요소: HMAC 서명 QR 검증(위조·변조 QR 차단), 먼저 찍은 폰만 조종하는 세션 점유 잠금, 로봇 전용 주소를 파이 안(127.0.0.1)으로 제한, 비밀값 환경변수 분리
 
 ![배선도](docs/wiring_diagram.png)
 
@@ -16,7 +16,8 @@
 |---|---|
 | 아두이노 우노 | 라인센서 읽기, 라인 따라가기(모터 제어), 초음파 4개 거리 측정, 거리값을 파이로 전송, 자체 안전 정지, 파이의 정지/출발 명령 실행 |
 | 라즈베리파이 | 거리값으로 칼만필터, 충돌시간(TTC), 위험 단계를 판단하고 정지(`S`)/재출발(`G`) 명령 전송 |
-| 웹 서버 (Flask) | 로그인, QR 서명 검증, 목적지(게이트) 선택 |
+| 웹 서버 (Flask) | 카트 QR 서명 검증, 폰 점유 잠금, 탑승구 선택, 카트 상태(위험 단계, TTC, 진행률) 표시, 반납 |
+| `cart_bridge.py` (파이) | 웹의 명령(출발/정지)을 읽어 카트를 제어하고, 카트 상태를 웹에 보고. 시리얼 포트는 이 프로그램만 엶 |
 
 아두이노와 파이는 **USB 선 하나**로 전원과 통신(시리얼 9600)을 함께 합니다.
 
@@ -27,7 +28,7 @@
                   모터 드라이버 ← 모터 배터리      └─ 정지(S) / 재출발(G) 명령
 ```
 
-> 웹 서버와 카트 제어는 `raspberry_pi/cart_integrated.py`에서 한 프로그램으로 합쳤습니다. 게이트를 선택해야 카트가 출발하고, 안전 정지는 항상 우선합니다. (가짜 시리얼 테스트만 통과, 실제 카트 시험은 아직)
+> 웹과 카트는 **프로세스 2개**로 나뉘어 파이 안에서 HTTP(127.0.0.1:5000)로만 연결됩니다. 웹은 시리얼을 열지 않아서 포트 충돌이 없습니다. 자세한 흐름: [`docs/web_link.md`](docs/web_link.md). 가짜 시리얼 테스트는 통과했고, 실제 카트 연동 시험은 진행 중입니다.
 
 ---
 
@@ -85,11 +86,16 @@
 
 위험 기준 거리와 TTC 계산 예시: [`docs/risk_and_ttc.md`](docs/risk_and_ttc.md)
 
+- `cart_bridge.py`: 웹의 `/robot/command`를 0.1초마다 읽어 출발 허가(`driving`/`returning`)가 있을 때만 `main.py`의 판단(`Brain`)으로 달리게 하고, 위험 단계·TTC·진행률을 `/robot/status`로 보고합니다. 웹 연결이 끊기면 안전하게 정지합니다. `TRIP_SECONDS`(출발점→게이트), `RETURN_LAP_SECONDS`(게이트→출발점, 우회 통로)를 시간으로 재서 넣으면 도착과 자동 반납이 동작합니다. (시간 기반 단순화)
+
 ### 4-3. 웹과 QR (`web/`)
 
-- `qr_signature.py`: 게이트 번호와 비밀키로 HMAC-SHA256 서명을 만들고 검증합니다. 위조된 QR은 거부됩니다.
-- `cart_web.py`: Flask 로그인과 목적지(게이트) 선택 화면입니다. 비밀번호는 해시로 보관하고, 로그인하지 않으면 목적지 선택을 거부합니다.
-- `test_cart_web.py`: 로그인, 위조 QR, 서명 없는 QR, 로그아웃을 확인하는 자동 테스트 11항목입니다.
+- `qr_signature.py`: 카트 번호와 비밀키(`CART_SECRET`)로 HMAC-SHA256 서명을 만들고 검증합니다. 변조된 QR은 거부됩니다.
+- `cart_web.py`: 카트 QR을 찍으면 서명을 확인하고 그 폰이 카트를 **점유**합니다(다른 폰은 "사용 중"). 점유한 폰만 탑승구 선택과 반납이 가능하고, 10분 동안 아무 요청이 없으면 잠금이 풀립니다. 로봇 전용 주소(`/robot/*`)는 파이 안에서만 접근할 수 있습니다.
+- `make_cart_qr.py`: 카트 뒤에 붙일 서명된 QR 주소와 이미지를 만듭니다.
+- `test_cart_web.py`: 서명 검증, 점유, 비상정지 권한, 로봇 주소 접근 제한, 반납을 확인하는 자동 테스트 27항목입니다.
+
+> 공항 이용자가 아이디/비밀번호로 로그인하는 것은 현실적이지 않아서 **로그인 대신 서명 QR + 세션 점유 잠금**으로 인증합니다. 한계: QR을 먼저 찍은 폰이 카트를 차지하므로 카트 앞에 있는 사람만 찍을 수 있다는 가정이 필요하며, 실제 서비스라면 카트 손잡이의 물리 버튼이나 근접 확인을 더해야 합니다.
 
 ---
 
@@ -108,24 +114,31 @@ python3 raspberry_pi/pi_obstacle_stop4.py /dev/ttyACM0   # 초음파만으로 �
 python3 raspberry_pi/main.py /dev/ttyACM0                # 초음파 + 라인 이탈 + (YOLO) 통합
 ```
 연결 후 5~6초 기다리면 시작합니다. 라인 없이 시험할 때는 `main.py`의 `USE_LINE_LOST = False`, YOLO를 안 쓸 때는 `USE_YOLO = False`로 바꿉니다.
-**웹 + 카트 제어를 함께 실행할 때** (시리얼 포트 하나를 한 프로그램이 쓰도록 합친 버전):
+**웹 + 카트를 함께 실행할 때** (터미널 2개, 같은 파이에서):
 ```bash
-export QR_SECRET_KEY=아무긴문자열 CART_SESSION_SECRET=아무긴문자열 CART_PASSWORD=원하는비밀번호
+# 터미널 1: 웹
+cd web
+export CART_SECRET="길고-무작위한-문자열" FLASK_SECRET="다른-길고-무작위한-문자열"
+CART_SIM=0 python3 cart_web.py            # CART_SIM=1(기본)이면 카트 없이 화면만 시험
+# QR 만들기 (같은 CART_SECRET, 파이 IP는 hostname -I)
+python3 make_cart_qr.py 07 http://<파이 IP>:5000   # cart_07_qr.png 를 카트 뒤에 붙임
+
+# 터미널 2: 카트
 cd raspberry_pi
-python3 cart_integrated.py /dev/ttyACM0       # 브라우저에서 http://<파이 IP>:5000
+python3 cart_bridge.py /dev/ttyACM0
 ```
-로그인 후 게이트를 고르면 출발하고, 목적지가 없으면 정지합니다. `/status`(상태 JSON), `/cancel`(목적지 취소 + 정지)을 추가했습니다. 이 버전은 YOLO를 쓰지 않습니다.
+폰과 파이는 같은 와이파이(또는 폰 핫스팟)에 있어야 하고, 폰으로 QR을 찍으면 탑승구 선택 화면이 열립니다. 이 버전은 YOLO를 쓰지 않습니다.
 
 시리얼 포트는 한 프로그램만 열 수 있어서 `pi_sensor_test.py`, `pi_obstacle_stop4.py`, `main.py`를 동시에 실행하면 안 됩니다. 아두이노 IDE의 시리얼 모니터도 닫고 실행합니다.
 
 ### 웹 (비밀값 설정)
-비밀값은 코드에 없고 환경변수로 받습니다. `.env.example`을 참고해 아래 3개를 설정합니다.
+비밀값은 코드에 없고 환경변수로만 받습니다. 설정이 없으면 실행되지 않습니다. 값을 바꾸면 QR을 다시 만들어야 합니다.
 ```bash
-export QR_SECRET_KEY="길고-무작위한-문자열"
-export CART_SESSION_SECRET="다른-길고-무작위한-문자열"
-export CART_PASSWORD="로그인-비밀번호"
-python3 web/cart_web.py          # http://localhost:5000
-python3 web/test_cart_web.py     # 자동 테스트 (테스트 전용 임시 값을 사용)
+export CART_SECRET="길고-무작위한-문자열"       # QR 서명 키
+export FLASK_SECRET="다른-길고-무작위한-문자열"  # 세션 키
+# 무작위 문자열 만들기: python3 -c "import secrets; print(secrets.token_hex(16))"
+cd web && python3 test_cart_web.py            # 자동 테스트 (테스트 전용 임시 값을 사용)
+cd ../raspberry_pi && python3 test_cart_integration_friendweb.py   # 웹 + cart_bridge 통합 시험 (가짜 시리얼)
 ```
 
 ---
@@ -137,7 +150,9 @@ python3 web/test_cart_web.py     # 자동 테스트 (테스트 전용 임시 값
 - [ ] 직선, 커브 라인 따라가기
 - [ ] 앞 장애물에서 정지, 치우면 재출발
 - [ ] 옆, 뒤 센서 동작
-- [ ] 웹 로그인과 QR 검증
+- [ ] 웹: QR 찍고 탑승구 선택 → 카트 출발
+- [ ] 웹 화면에 위험 단계·TTC 표시, 장애물 정지/재출발
+- [ ] 도착 후 정지, 반납 → 우회 통로 복귀 (시간 측정값: TRIP_SECONDS __ / RETURN_LAP_SECONDS __)
 
 ---
 
@@ -147,7 +162,9 @@ python3 web/test_cart_web.py     # 자동 테스트 (테스트 전용 임시 값
 - 장애물 앞에서는 정지와 대기를 기본으로 하고, 우회 주행은 후속 과제입니다.
 - 실제 크기의 카트에 적용하려면 속도에 맞춘 제동 거리와 반응 시간 보정, 더 먼 거리를 보는 센서가 필요합니다. (HC-SR04는 약 2m 이내)
 - 초음파는 반사 환경(재질, 각도)에 따라 값이 튈 수 있어 칼만필터와 연속 프레임 확인으로 보완했습니다.
-- 카메라(YOLO) 기반 사람 인식, 목적지 도착 판단, 게이트별 분기 경로, 아두이노-파이 무선 통신은 후속 과제입니다.
+- 도착과 복귀는 센서가 아니라 **주행 시간**으로 판단하는 단순화입니다. (게이트 앞 정지, 출발점 정지) 배터리가 줄면 위치가 어긋날 수 있어 실제로는 바닥 마커나 카메라가 필요합니다.
+- 복귀는 게이트 뒤로 이어지는 우회 통로(순환 라인)를 따라 앞으로 달리는 방식입니다. 게이트별(A/B) 분기 경로는 후속 과제입니다.
+- 카메라(YOLO) 기반 사람 인식, 아두이노-파이 무선 통신은 후속 과제입니다.
 
 ---
 
@@ -164,7 +181,7 @@ airport-smart-cart/
 ├─ README.md
 ├─ requirements.txt
 ├─ .env.example
-├─ docs/            # 배선도, 핀 표, 위험 기준과 TTC 계산, 트러블슈팅, 트랙 도면, CHANGELOG
+├─ docs/            # 배선도, 핀 표, 위험 기준과 TTC 계산, 웹 연동, 트러블슈팅, 트랙 도면, CHANGELOG
 ├─ photos/          # 배선·시연 사진
 ├─ arduino/
 │   ├─ cart_main/cart_main.ino
@@ -173,9 +190,13 @@ airport-smart-cart/
 │   ├─ week1_obstacle_logic.py
 │   ├─ pi_obstacle_stop4.py
 │   ├─ pi_sensor_test.py
-│   └─ main.py
+│   ├─ main.py
+│   ├─ cart_bridge.py                      # 웹 <-> 카트 연결
+│   ├─ test_cart_bridge.py
+│   └─ test_cart_integration_friendweb.py
 └─ web/
     ├─ cart_web.py
     ├─ qr_signature.py
+    ├─ make_cart_qr.py
     └─ test_cart_web.py
 ```

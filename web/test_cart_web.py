@@ -1,69 +1,107 @@
 # -*- coding: utf-8 -*-
 """
-test_cart_web.py
-cart_web.py의 로그인/인증/QR 검증 동작을 자동으로 확인하는 테스트.
+test_cart_web.py  -  새 흐름(카트 QR -> 점유 -> 탑승구 선택 -> 주행 -> 도착 -> 반납) 자동 테스트
 실행: python3 test_cart_web.py
 """
 import os
 
-# 테스트 전용 값 (실제 비밀값이 아님). 이미 환경변수가 있으면 그것을 쓴다.
-os.environ.setdefault("QR_SECRET_KEY", "test-only-qr-key")
-os.environ.setdefault("CART_SESSION_SECRET", "test-only-session-secret")
-os.environ.setdefault("CART_PASSWORD", "test-only-password")
+os.environ["CART_SIM"] = "0"  # 테스트 중엔 가짜 주행 끔
+os.environ.setdefault("CART_SECRET", "test-only-secret")      # 테스트 전용 임시 값 (실제 값 아님)
+os.environ.setdefault("FLASK_SECRET", "test-only-session-secret")
+os.environ["CART_ID"] = "07"
 
-from cart_web import app, state, GATE_QR
-
-PASSWORD = os.environ["CART_PASSWORD"]
-USER = os.environ.get("CART_USER", "passenger1")
+import cart_web
+from cart_web import app, cart, reset_cart
+from qr_signature import make_signature
 
 results = []
 
 
 def check(name, cond):
-    results.append((name, cond))
+    results.append(cond)
     print(f"[{'PASS' if cond else 'FAIL'}] {name}")
 
 
-c = app.test_client()
+SIG = make_signature("07")
+reset_cart()
+phone1 = app.test_client()
+phone2 = app.test_client()
 
-# 1. 비로그인 접근 -> 로그인 페이지로 이동
-r = c.get("/")
-check("비로그인으로 메인 접근 시 로그인 페이지로 이동(302)", r.status_code == 302 and "/login" in r.headers["Location"])
-
-# 2. 비로그인 상태에서 목적지 선택 시도 -> 거부
-r = c.post("/select", data={"qr": GATE_QR["B12"]})
-check("비로그인 상태 목적지 선택 요청 거부(401)", r.status_code == 401)
-check("거부된 요청은 목적지가 바뀌지 않음", state["destination"] is None)
-
-# 3. 틀린 비밀번호
-r = c.post("/login", data={"username": USER, "password": "wrong"})
-check("틀린 비밀번호 로그인 거부(401)", r.status_code == 401)
-
-# 4. 정상 로그인
-r = c.post("/login", data={"username": USER, "password": PASSWORD})
-check("정상 로그인 성공(302 이동)", r.status_code == 302)
-r = c.get("/")
-check("로그인 후 메인 화면 접근 가능(200)", r.status_code == 200)
-
-# 5. 정상 서명 QR로 목적지 선택
-r = c.post("/select", data={"qr": GATE_QR["B12"]})
-check("정상 서명 QR로 목적지 선택 성공", r.status_code == 302 and state["destination"] == "B12")
-
-# 6. 위조 QR (게이트번호만 바꿔치기)
-forged = GATE_QR["B12"].replace("GATE=B12", "GATE=C30")
-r = c.post("/select", data={"qr": forged})
-check("위조 QR(게이트번호 변조) 거부(403)", r.status_code == 403)
-check("위조 QR 시도 후에도 목적지는 B12 유지", state["destination"] == "B12")
-
-# 7. 서명 없는 QR
-r = c.post("/select", data={"qr": "GATE=A03"})
+# --- QR 서명 ---
+r = phone1.get("/c/07?sig=0000000000000000")
+check("서명 틀린 카트 QR 거부(403)", r.status_code == 403 and cart["owner"] is None)
+r = phone1.get(f"/c/08?sig={SIG}")
+check("카트 번호만 바꾼 QR 거부(403)", r.status_code == 403)
+r = phone1.get("/c/07")
 check("서명 없는 QR 거부(403)", r.status_code == 403)
 
-# 8. 로그아웃 후 다시 접근 불가
-c.get("/logout")
-r = c.get("/")
-check("로그아웃 후 메인 접근 시 다시 로그인 요구", r.status_code == 302)
+# --- QR 안 찍고 조작 시도 ---
+r = phone1.post("/api/select", json={"gate": "A"})
+check("QR 안 찍은 폰은 탑승구 선택 불가(403)", r.status_code == 403 and cart["gate"] is None)
+
+# --- 정상 QR -> 점유 ---
+r = phone1.get(f"/c/07?sig={SIG}")
+check("정상 QR 찍으면 카트 점유 + 메인으로 이동(302)", r.status_code == 302 and cart["owner"] and cart["phase"] == "ready")
+check("점유한 폰은 상태 조회 가능", phone1.get("/api/status").get_json()["ok"])
+
+# --- 다른 폰이 같은 QR (복사) ---
+r = phone2.get(f"/c/07?sig={SIG}")
+check("다른 폰이 같은 QR 찍으면 '사용 중' 거부(409)", r.status_code == 409)
+r = phone2.post("/api/select", json={"gate": "B"})
+check("다른 폰은 목적지 변경 불가(403)", r.status_code == 403 and cart["gate"] is None)
+r = phone2.post("/api/stop", json={})
+check("다른 폰은 비상정지도 못 누름(403)", r.status_code == 403 and not cart["stopped"])
+
+# --- 탑승구 선택 ---
+r = phone1.post("/api/select", json={"gate": "Z"})
+check("없는 탑승구 거부(400)", r.status_code == 400)
+r = phone1.post("/api/select", data={"gate": "A"})
+check("JSON 아닌 form 요청 거부(CSRF 방지, 400)", r.status_code == 400 and cart["gate"] is None)
+r = phone1.post("/api/select", json={"gate": "A"})
+check("A게이트 선택 -> 주행 시작", r.status_code == 200 and cart["phase"] == "driving" and cart["gate"] == "A")
+r = phone1.post("/api/select", json={"gate": "B"})
+check("주행 중엔 목적지 변경 불가(409)", r.status_code == 409 and cart["gate"] == "A")
+
+# --- 비상정지 ---
+phone1.post("/api/stop", json={})
+check("비상정지 -> 로봇 명령에 stopped=True", phone1.get("/robot/command").get_json()["stopped"] is True)
+phone1.post("/api/resume", json={})
+check("다시 출발 -> stopped=False", cart["stopped"] is False)
+
+# --- 로봇 API ---
+outsider = app.test_client()
+r = outsider.get("/robot/command", environ_base={"REMOTE_ADDR": "192.168.0.50"})
+check("외부 IP에서 로봇 API 접근 거부(403)", r.status_code == 403)
+r = outsider.post("/robot/status", json={"arrived": True}, environ_base={"REMOTE_ADDR": "192.168.0.50"})
+check("외부 IP가 '도착' 가짜 보고 못 함", r.status_code == 403 and cart["phase"] == "driving")
+phone1.post("/robot/status", json={"progress": 0.5, "message": "캐리어 감지 · 감속", "tier": "위험", "ttc": 1.4})
+s = phone1.get("/api/status").get_json()["cart"]
+check("로봇이 올린 상태가 폰 화면 데이터에 반영", s["tier"] == "위험" and s["ttc"] == 1.4)
+
+# --- 반납은 도착 후에만 ---
+r = phone1.post("/api/return", json={})
+check("주행 중엔 반납 불가(409)", r.status_code == 409)
+phone1.post("/robot/status", json={"arrived": True})
+check("로봇 도착 보고 -> arrived", cart["phase"] == "arrived")
+r = phone1.post("/api/return", json={})
+check("도착 후 반납 -> 잠금 해제 + 복귀 중", r.status_code == 200 and cart["owner"] is None and cart["phase"] == "returning")
+check("반납한 폰은 더 이상 조작 불가", phone1.post("/api/stop", json={}).status_code == 403)
+r = phone2.get(f"/c/07?sig={SIG}")
+check("복귀 중엔 다른 사람도 못 잡음(409)", r.status_code == 409)
+phone1.post("/robot/status", json={"returned": True})
+r = phone2.get(f"/c/07?sig={SIG}")
+check("대기소 복귀 후엔 다음 승객이 점유 가능", r.status_code == 302 and cart["phase"] == "ready")
+
+# --- 방치 타임아웃 ---
+cart["last_seen"] -= cart_web.LOCK_TIMEOUT + 1
+r = phone1.get(f"/c/07?sig={SIG}")
+check("10분 방치된 잠금은 풀려서 다른 폰이 점유 가능", r.status_code == 302)
+
+# --- 화면 ---
+html = phone1.get("/").get_data(as_text=True)
+check("점유한 폰은 탑승구 선택 화면을 받음", "탑승구 선택" in html)
+html = app.test_client().get("/").get_data(as_text=True)
+check("QR 안 찍은 폰은 'QR을 찍어주세요' 화면", "카트 뒤 QR을 찍어주세요" in html)
 
 print("-" * 50)
-passed = sum(1 for _, ok in results if ok)
-print(f"결과: {passed}/{len(results)} 통과")
+print(f"결과: {sum(results)}/{len(results)} 통과")
